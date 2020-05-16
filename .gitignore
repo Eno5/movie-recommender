@@ -127,3 +127,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# VS Code
+.vscode
+
+# Notebooks, zip files, and csv files
+*.zip
+*.csv
+*.ipynb
