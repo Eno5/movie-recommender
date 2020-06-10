@@ -1,63 +1,32 @@
-from zipfile import ZipFile as _zip # TODO won't need once databases are made
-from io import BytesIO as _BIO # TODO won't need once databases are made
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
-from time import time
 import sys
+import sqlite3
 
-data = _zip('raw data.zip')
-
-def loadData(filename, cols=None): # TODO won't need once databases are made
-    return pd.read_csv(_BIO(data.read(f'ml-25m/{filename}.csv')), usecols=cols)
+conn = sqlite3.connect('movie_ratings.db')
 
 def norm(series):
     return (series - series.min()) / (series.max() - series.min())
 
-def filterUsers(ratings): # TODO won't need once database is made
-    """Excludes users with too many reviews or are too biased.
-    
-    :: Params ::
-    ratings - user ratings DataFrame
-    """
-    user_ratings = ratings.groupby('userId')['rating'].agg(['mean','count'])
-    score_avg = user_ratings['mean'].mean()
-    score_std = user_ratings['mean'].std()
-    users_too_biased = user_ratings['mean'][lambda x: (x>=score_avg+score_std*2)
-                                            | (x<=score_avg-score_std*2)].dropna()
-
-    reviews_avg = user_ratings['count'].mean()
-    reviews_std = user_ratings['count'].std()
-    users_too_many_reviews = user_ratings['count'][lambda x: x>reviews_avg+reviews_std*2].dropna()
-
-    return ratings[~ratings['userId'].isin(users_too_biased.index)
-                    & ~ratings['userId'].isin(users_too_many_reviews.index)].reset_index()
-
-def filterMovies(ratings, n=40): # TODO won't need once ratings database is made
-    """Excludes movies with too few reviews.
-    
-    :: Params ::
-    ratings - user ratings DataFrame
-    n - least number of reviews to include
-    """
-    movie_count = ratings.groupby('movieId')['userId'].count()
-    movies_too_few_reviews = movie_count[lambda x: x<n].dropna()
-
-    return ratings[~ratings['movieId'].isin(movies_too_few_reviews.index)].reset_index()
-
-def findSimilarMovies(selected_movie, ratings): # TODO ratings to be database
-    """Returns array of other movies liked by similar users (at least 3/5 stars).
+def findSimilarMovies(selected_movie, c=conn):
+    """Creates temp table of other movies rated by similar users (at least 3/5 stars).
+        Also returns DataFrame with avg ratings and number of reviews for other movies.
     
     :: Params ::
     selected_movie - movieId of the base movie
-    ratings - user ratings DataFrame
+    c - connection to database
+    """
+    SQL = """
+        WITH users AS (
+            SELECT DISTINCT userId FROM ratings
+            WHERE movieId=? AND rating >= 3
+        )
+        SELECT movieId, rating FROM ratings
+        WHERE userId IN (SELECT userId FROM users LIMIT 10000)
     """
 
-    # similar_users = ratings[(ratings['movieId']==selected_movie)
-    #                         & (ratings['rating']>=3)]['userId'].unique()
-    similar_users = ratings.query(f'movieId=={selected_movie} & rating>=3')['userId'].unique()
-    print(f'Number of similar users: {len(similar_users)}')
-    
-    return ratings[ratings['userId'].isin(similar_users)]
+    movie_ratings = pd.read_sql(SQL, c, params=(selected_movie,)).groupby('movieId')['rating'].agg(['count','mean'])
+    return movie_ratings
 
 def getSimilarity(selected_movie, df):
     """Finds cosine similarity between selected_movie and similar movies.
@@ -78,47 +47,44 @@ def getSimilarity(selected_movie, df):
                         index=df.index,
                         columns=df.index)[selected_movie]
 
-def findGenreSimilarity(selected_movie, similar_movies, movies): # TODO movies to be database
-    """Finds genre similarity between selected_movie and similar_movies.
+def findGenreSimilarity(selected_movie, movies, c=conn):
+    """Finds genre similarity between selected_movie and similar movies.
     
     :: Params ::
     selected_movie - movieId of the base movie
-    similar_movies - iterable with movies liked by similar users
-    movies - movies DataFrame with genres, movieId's, and titles
+    movies - similar movies DataFrame
+    c - connection to database
     """
-    df = movies[movies['movieId'].isin(similar_movies)].set_index('movieId').drop(columns='title')
+    df = pd.read_sql('SELECT * FROM movies', c)
+    df = df[df['movieId'].isin(movies.index)].set_index('movieId').drop(columns='title')
+
     return getSimilarity(selected_movie, df)
 
-def findTagSimilarity(selected_movie, similar_movies, tags): # TODO tags to be database
-    """Finds tag similarity between selected_movie and similar_movies.
+def findTagSimilarity(selected_movie, movies, c=conn):
+    """Finds tag similarity between selected_movie and similar movies.
     
     :: Params ::
     selected_movie - movieId of the base movie
-    similar_movies - iterable with movies liked by similar users
-    tags - tags DataFrame with tag relevance per movieId
+    movies - similar movies DataFrame
+    c - connection to database
     """
-    df = tags[tags['movieId'].isin(similar_movies)].pivot(index='movieId',
-                                                            columns='tagId',
-                                                            values='relevance')
+    df = pd.read_sql('SELECT * FROM tags', c)    
+    df = df[df['movieId'].isin(movies.index)].pivot(index='movieId',
+                                                    columns='compId',
+                                                    values='score')
 
     return getSimilarity(selected_movie, df)
 
-def preProcess(selected_movie, ratings, movies, tags): # TODO ratings, movies, tags to be databases
-    print('Finding similar movies (Will be a database query in future)')
-    similar_movies_data = findSimilarMovies(selected_movie, ratings)
-    similar_movies = similar_movies_data['movieId'].unique()
-    print(f'Number of similar movies: {len(similar_movies)}')
-    similar_movie_ratings = similar_movies_data.groupby('movieId')['rating'].agg(['count','mean'])
-    del similar_movies_data
-
-    start_time = time() # TODO remove from production
+def preProcess(selected_movie):
+    print('Finding similar movies')
+    movie_ratings = findSimilarMovies(selected_movie)
     print('Finding genre similarities')
-    genre_sim = findGenreSimilarity(selected_movie, similar_movies, movies)
+    genre_sim = findGenreSimilarity(selected_movie, movie_ratings)
     print('Finding tag similarities')
-    tag_sim = findTagSimilarity(selected_movie, similar_movies, tags)
+    tag_sim = findTagSimilarity(selected_movie, movie_ratings)
 
     print('Merging datasets')
-    movie_data = pd.merge(similar_movie_ratings, genre_sim, left_index=True, right_index=True)
+    movie_data = pd.merge(movie_ratings, genre_sim, left_index=True, right_index=True)
     movie_data = pd.merge(movie_data, tag_sim, left_index=True, right_index=True)
     movie_data.columns = ['review_count','avg_rating','genre_sim','tag_sim']
     try:
@@ -133,7 +99,7 @@ def preProcess(selected_movie, ratings, movies, tags): # TODO ratings, movies, t
             'tag_sim_thresh': desc.loc['75%','tag_sim'],
             'avg_count': desc.loc['50%','review_count']}
 
-    return movie_data, hist, start_time
+    return movie_data, hist
 
 def recommendations(movie_data, hist):
     """Generates top picks and interesting finds from similar movies and stats."""
@@ -141,14 +107,11 @@ def recommendations(movie_data, hist):
     tag_sim = hist['tag_sim_thresh']
     avg_count = hist['avg_count']
     avg_rating = hist['avg_rating']
-    # similar = movie_data.query(f'genre_sim >= {genre_sim} & tag_sim >= {tag_sim}')
     similar = f'genre_sim >= {genre_sim} & tag_sim >= {tag_sim}'
     
     top_10_count = movie_data.quantile(0.9).loc['review_count']
-    # top_picks_query = f'review_count >= {top_10_count} & avg_rating >= {avg_rating} & {similar}'
-    # interesting_query = f'review_count >= {avg_count} & avg_rating >= {avg_rating+0.5} & {similar}'
-    top_picks_query = f'review_count >= {top_10_count} & avg_rating >= {avg_rating} & genre_sim >= {genre_sim} & tag_sim >= {tag_sim}'
-    interesting_query = f'review_count >= {avg_count} & avg_rating >= {avg_rating+0.5} & genre_sim >= {genre_sim} & tag_sim >= {tag_sim}'
+    top_picks_query = f'review_count >= {top_10_count} & avg_rating >= {avg_rating} & {similar}'
+    interesting_query = f'review_count >= {avg_count} & avg_rating >= {avg_rating+0.5} & {similar}'
 
     top_picks = movie_data.query(top_picks_query).sort_values(by=['tag_sim',
                                                                 'review_count',
@@ -164,34 +127,52 @@ def recommendations(movie_data, hist):
 
     return top_picks, interesting_finds
 
+def get_titles(df, c=conn):
+    """Returns titles of recommendations."""
+    movies = list(df.index)
+    SQL = """
+            SELECT movieId, title FROM movies WHERE movieId IN({})
+    """.format(','.join('?' * len(movies)))
+    movies = pd.read_sql(SQL, c, params=movies)
+    return pd.merge(df, movies, left_index=True, right_on='movieId')['title']
+
+def get_movie(name, year=None, c=conn):
+    """Returns movieId of named movie. Year can be provided for better accuracy in pull."""
+
+    SQL = 'SELECT movieId, title FROM movies WHERE title LIKE ? LIMIT 1'
+    if year:
+        return pd.read_sql(SQL, c, params=(f'%{name}%({year})',))
+    else:
+        return pd.read_sql(SQL, c, params=(f'%{name}%',))
+
 if __name__=="__main__":
-    selected_movie = int(sys.argv[1])
+    name = sys.argv[1]
+    try:
+        year = sys.argv[2]
+    except:
+        year = None
 
-    print('Loading datasets (Will be databases in future)')
-    ratings = loadData('ratings', cols=['userId','movieId','rating'])
-    movies = pd.read_csv('movies_processed.csv') # movieId, title, genres (boolean)
-    tags = loadData('genome-scores')
-    # genome_tags = loadData('genome-tags') # tagId, tag
-    # links = loadData('links', cols=['movieId, imdbId']) # http://www.imdb.com/title/tt{imdbId}, leading 0's needed if len(imdbId) < 7
-
-    print('Filtering ratings dataset (Will be in database in future)')
-    ratings = filterMovies(filterUsers(ratings))
-
-    print('Gathering data on similar movies')
-    movie_data, hist, start_time = preProcess(selected_movie, ratings, movies, tags)
-
-    top_picks, interesting = recommendations(movie_data, hist)
-
-    def get_titles(df, movies=movies):
-        """Returns titles of recommendations."""
-        return pd.merge(df, movies[['movieId','title']], left_index=True, right_on='movieId')['title']
+    try:
+        selected_movie = get_movie(name, year).loc[0]
+    except KeyError:
+        print('Could not find movie')
+        sys.exit()
     
+    print(f"Recommendations based on: {selected_movie['title']}")
+    print('-'*70)
+
+    print('Processing')
+    top_picks, interesting = recommendations(*preProcess(int(selected_movie['movieId'])))
+
     top_picks = get_titles(top_picks)
     interesting = get_titles(interesting)
 
-    print('Took {:2f}s to complete'.format(time()-start_time))
-
+    print('-'*70)
     print('Top Picks:')
-    print(top_picks.values)
+    for title in top_picks.values:
+        print(title)
+    print('-'*70)
     print('Also Check Out:')
-    print(interesting.values)
+    for title in interesting.values:
+        print(title)
+    sys.exit()
